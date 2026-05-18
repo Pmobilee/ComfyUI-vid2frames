@@ -31,6 +31,19 @@ def _normalize_selector(selector):
     return "best"
 
 
+def _selector_rank(selector):
+    text = re.sub(r"\s+", " ", str(selector or "").strip().lower())
+    patterns = (
+        r"(?:rank|option|variant|choice|pick)\s*#?\s*(\d+)",
+        r"#\s*(\d+)",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, text)
+        if match:
+            return max(1, int(match.group(1)))
+    return 1
+
+
 def _normalized(values):
     values = np.asarray(values, dtype=np.float32)
     if values.size == 0:
@@ -70,6 +83,14 @@ def _center_tiebreak(count):
     midpoint = (count - 1) / 2.0
     distances = np.abs(np.arange(count, dtype=np.float32) - midpoint)
     return (1.0 - (distances / max(midpoint, 1.0))) * 1e-4
+
+
+def _default_min_separation(frame_count, desired_count):
+    if desired_count <= 1 or frame_count <= 2:
+        return 0
+    ratio_gap = int(round(frame_count * 0.12))
+    spread_cap = frame_count // max(desired_count + 1, 1)
+    return max(1, min(spread_cap, max(8, ratio_gap)))
 
 
 def _gray_frame(rgb_frame):
@@ -181,6 +202,69 @@ def _opencv_face_scores(rgb_frames):
     return np.asarray(scores, dtype=np.float32)
 
 
+def _score_metrics(metrics, mode):
+    count = len(metrics["blur"])
+    sharp = _normalized(metrics["blur"])
+    motion = _normalized(metrics["motion"])
+    lighting = _normalized(metrics["lighting"])
+    face = _normalized(metrics["face"])
+
+    stable = 1.0 - lighting
+    low_motion = 1.0 - motion
+    no_face = 1.0 - face
+    blurry = 1.0 - sharp
+    moderate_motion = np.clip(1.0 - np.abs(motion - 0.55) * 2.0, 0.0, 1.0)
+
+    if mode == "no_face":
+        score = no_face * 0.55 + sharp * 0.20 + stable * 0.15 + low_motion * 0.10
+    elif mode == "blurry":
+        score = blurry * 0.70 + stable * 0.15 + face * 0.10 + low_motion * 0.05
+    elif mode == "moving":
+        score = motion * 0.55 + sharp * 0.25 + stable * 0.15 + face * 0.05
+    elif mode == "static":
+        score = low_motion * 0.45 + sharp * 0.35 + stable * 0.15 + face * 0.05
+    elif mode == "lighting":
+        score = lighting * 0.65 + sharp * 0.20 + motion * 0.10 + face * 0.05
+    else:
+        score = sharp * 0.50 + stable * 0.20 + moderate_motion * 0.15 + face * 0.15
+
+    return score * _edge_weights(count) + _center_tiebreak(count)
+
+
+def _ranked_indices(metrics, mode, count=1, min_separation=None):
+    frame_count = len(metrics["blur"])
+    if frame_count == 0:
+        return []
+
+    wanted = min(max(1, int(count)), frame_count)
+    gap = (
+        _default_min_separation(frame_count, wanted)
+        if min_separation is None
+        else max(0, int(min_separation))
+    )
+    scores = _score_metrics(metrics, mode)
+    order = [int(index) for index in np.argsort(scores)[::-1]]
+    chosen = []
+    relax_by = max(1, int(round(max(gap, 1) * 0.25)))
+
+    while len(chosen) < wanted:
+        added = False
+        for index in order:
+            if index in chosen:
+                continue
+            if all(abs(index - other) >= gap for other in chosen):
+                chosen.append(index)
+                added = True
+                if len(chosen) == wanted:
+                    break
+        if len(chosen) == wanted or gap == 0:
+            break
+        if not added or len(chosen) < wanted:
+            gap = max(0, gap - relax_by)
+
+    return chosen
+
+
 class AIA_SelectVideoFrame:
     RETURN_TYPES = ("IMAGE",)
     FUNCTION = "select"
@@ -218,33 +302,11 @@ class AIA_SelectVideoFrame:
 
     @staticmethod
     def _choose_index(metrics, mode):
-        count = len(metrics["blur"])
-        sharp = _normalized(metrics["blur"])
-        motion = _normalized(metrics["motion"])
-        lighting = _normalized(metrics["lighting"])
-        face = _normalized(metrics["face"])
+        return _ranked_indices(metrics, mode, count=1)[0]
 
-        stable = 1.0 - lighting
-        low_motion = 1.0 - motion
-        no_face = 1.0 - face
-        blurry = 1.0 - sharp
-        moderate_motion = np.clip(1.0 - np.abs(motion - 0.55) * 2.0, 0.0, 1.0)
-
-        if mode == "no_face":
-            score = no_face * 0.55 + sharp * 0.20 + stable * 0.15 + low_motion * 0.10
-        elif mode == "blurry":
-            score = blurry * 0.70 + stable * 0.15 + face * 0.10 + low_motion * 0.05
-        elif mode == "moving":
-            score = motion * 0.55 + sharp * 0.25 + stable * 0.15 + face * 0.05
-        elif mode == "static":
-            score = low_motion * 0.45 + sharp * 0.35 + stable * 0.15 + face * 0.05
-        elif mode == "lighting":
-            score = lighting * 0.65 + sharp * 0.20 + motion * 0.10 + face * 0.05
-        else:
-            score = sharp * 0.50 + stable * 0.20 + moderate_motion * 0.15 + face * 0.15
-
-        score = score * _edge_weights(count) + _center_tiebreak(count)
-        return int(np.argmax(score))
+    @staticmethod
+    def _ranked_indices(metrics, mode, count=1, min_separation=None):
+        return _ranked_indices(metrics, mode, count=count, min_separation=min_separation)
 
     def select(self, image, selector):
         if image is None or image.shape[0] == 0:
@@ -252,9 +314,14 @@ class AIA_SelectVideoFrame:
 
         frames = image.detach().cpu().numpy()
         mode = _normalize_selector(selector)
+        rank = _selector_rank(selector)
         metrics = self._metrics(frames)
-        index = self._choose_index(metrics, mode)
-        print(f"AIA_SelectVideoFrame: selector={selector!r} mode={mode} index={index}/{image.shape[0]}")
+        indices = self._ranked_indices(metrics, mode, count=rank)
+        index = indices[min(rank - 1, len(indices) - 1)]
+        print(
+            "AIA_SelectVideoFrame: "
+            f"selector={selector!r} mode={mode} rank={rank} index={index}/{image.shape[0]}"
+        )
         return (image[index : index + 1].to(device=image.device, dtype=image.dtype),)
 
 
