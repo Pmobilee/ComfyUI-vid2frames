@@ -1,42 +1,17 @@
-# ComfyUI-vid2frames
+# ComfyUI-AIA-BatchVideoDegrade
 
-ComfyUI custom node for selecting one useful still frame from a decoded video frame batch.
+Small AIA custom node pack for applying cheap-phone/video-upload degradation to a
+batched ComfyUI `IMAGE` tensor.
 
-## Node
+Repository: https://github.com/Pmobilee/ComfyUI-vid2frames
 
-- `AIA_SelectVideoFrame` / **AIA Select Video Frame**
+## Nodes
 
-The node accepts a batched ComfyUI `IMAGE` tensor and a selector string, then returns exactly one `IMAGE` frame.
-
-Supported selector targets:
-
-- empty / unknown / `best still` -> best still-frame scoring
-- `no face` -> lowest face score while still preferring usable frames
-- `blurry` -> blurriest reasonable frame
-- `moving` -> highest-motion frame with blur/light penalties
-- `static` -> lowest-motion sharp frame
-- `flicker` / `lighting` -> strongest lighting fluctuation
-
-## Metrics
-
-- Sharpness: Laplacian variance
-- Motion: neighbor frame pixel delta, smoothed over a 5-frame window
-- Lighting fluctuation: luminance delta, smoothed over a 5-frame window
-- Face score: MediaPipe face detection first, OpenCV Haar fallback
-- Edge penalty: first/last 8% of frames are penalized for longer videos
-
-## Install
-
-Clone into ComfyUI custom nodes:
-
-```bash
-cd /home/ComfyUI/custom_nodes
-git clone https://github.com/Pmobilee/ComfyUI-vid2frames.git
-pip install -r ComfyUI-vid2frames/requirements.txt
-```
-
-Restart ComfyUI after installation.
-
-## Workflow Use
-
-Wire decoded video frames into `AIA_SelectVideoFrame`, pass selector text such as `moving` or `no face`, then connect the output to `SaveImage`.
+- `AIA_BatchDequality`: applies per-frame JPEG recompression, sensor-like noise,
+  and small brightness/color/contrast jitter while preserving batch shape.
+- `AIA_SelectVideoFrame`: scores a decoded video frame batch and returns one
+  selected frame. The selector string supports `no face`, `blurry`, `moving`,
+  `static`, `flicker`, and `lighting`; empty or unknown selectors use best-still
+  scoring. Add an explicit rank such as `moving rank 2` or `lighting #3` to get
+  the next high-scoring frame for that category, with temporal spacing applied
+  so ranked picks do not cluster around the same moment.
