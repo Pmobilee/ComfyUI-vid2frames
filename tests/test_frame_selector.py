@@ -13,6 +13,7 @@ SPEC.loader.exec_module(frame_selector)
 
 AIA_SelectVideoFrame = frame_selector.AIA_SelectVideoFrame
 _normalize_selector = frame_selector._normalize_selector
+_selector_rank = frame_selector._selector_rank
 
 
 def _checker(size=64, block=8):
@@ -42,6 +43,27 @@ def test_selector_aliases():
     assert _normalize_selector("static pose") == "static"
     assert _normalize_selector("strong lighting flicker") == "lighting"
     assert _normalize_selector("whatever") == "best"
+    assert _selector_rank("moving") == 1
+    assert _selector_rank("moving rank 2") == 2
+    assert _selector_rank("lighting #3") == 3
+
+
+def test_ranked_indices_spread_candidates_apart():
+    metrics = {
+        "blur": np.asarray([0, 10, 100, 99, 20, 10, 0, 94, 0, 93], dtype=np.float32),
+        "motion": np.zeros(10, dtype=np.float32),
+        "lighting": np.zeros(10, dtype=np.float32),
+        "face": np.ones(10, dtype=np.float32),
+    }
+
+    indices = AIA_SelectVideoFrame._ranked_indices(
+        metrics,
+        "best",
+        count=3,
+        min_separation=3,
+    )
+
+    assert indices == [2, 7, 9]
 
 
 def test_blurry_mode_selects_soft_frame(monkeypatch):
@@ -98,6 +120,29 @@ def test_no_face_mode_uses_face_scores(monkeypatch):
     selected = AIA_SelectVideoFrame().select(_to_tensor(frames), "no face")[0]
 
     assert torch.allclose(selected[0], _to_tensor([frames[2]])[0])
+
+
+def test_ranked_selector_can_pick_second_distinct_frame(monkeypatch):
+    frames = [_checker() for _ in range(40)]
+    frames[10] = np.full((64, 64, 3), 210, dtype=np.uint8)
+    frames[30] = np.full((64, 64, 3), 180, dtype=np.uint8)
+    metrics = {
+        "blur": np.asarray([1.0] * 40, dtype=np.float32),
+        "motion": np.asarray([0.0] * 40, dtype=np.float32),
+        "lighting": np.asarray([0.0] * 40, dtype=np.float32),
+        "face": np.asarray([1.0] * 40, dtype=np.float32),
+    }
+    metrics["motion"][10] = 10.0
+    metrics["motion"][30] = 9.0
+    monkeypatch.setattr(
+        AIA_SelectVideoFrame,
+        "_metrics",
+        classmethod(lambda _cls, _frames: metrics),
+    )
+
+    selected = AIA_SelectVideoFrame().select(_to_tensor(frames), "moving rank 2")[0]
+
+    assert torch.allclose(selected[0], _to_tensor([frames[30]])[0])
 
 
 def test_smoke_241_frame_batch(monkeypatch):
